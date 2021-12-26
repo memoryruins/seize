@@ -436,10 +436,14 @@ where
 
                 // Try to find this key in the bucket
                 let mut node_ptr = &table.buckets[bucket_index as usize];
-                let node = node_ptr.load(Ordering::Acquire, guard);
 
-                while !node.is_null() {
-                    let node_ref = unsafe { node.as_ref_unchecked() };
+                loop {
+                    let node = node_ptr.load(Ordering::Acquire, guard);
+
+                    let node_ref = match unsafe { node.as_ref() } {
+                        Some(n) => n,
+                        None => break,
+                    };
 
                     // If the key already exists, update the value.
                     if hash == node_ref.hash && node_ref.key == key {
