@@ -5,6 +5,6 @@ mod pinned;
 pub use pinned::Pinned;
 
 mod map;
-pub use map::{HashMap, Iter, Keys, Values};
+pub use map::HashMap;
 
 mod resize;

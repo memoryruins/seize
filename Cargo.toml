@@ -1,5 +1,5 @@
 [package]
-name = "seize"
+name = "seizem"
 version = "0.0.0"
 authors = ["Ibraheem Ahmed <ibrah1440@gmail.com>"]
 edition = "2018"
@@ -18,4 +18,4 @@ exclude = ["/dotnet/**"]
 num_cpus = "1.13.0"
 lock_api = "0.4.5"
 parking_lot = "0.11.2"
-flize = { git = "https://github.com/xacrimon/flize" }
+seize = { git = "https://github.com/ibraheemdev/seize" }

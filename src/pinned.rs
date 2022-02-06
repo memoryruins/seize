@@ -1,12 +1,11 @@
-use crate::{HashMap, Iter, Keys, Values};
+use crate::HashMap;
 
 use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
-use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::ops::Index;
 
-use flize::ThinShield;
+use seize::*;
 
 /// A reference to a [`HashMap`] pinned to the current thread.
 ///
@@ -14,72 +13,72 @@ use flize::ThinShield;
 /// Dropping a pinned reference will trigger garbage collection.
 pub struct Pinned<'a, K, V, S = RandomState> {
     pub(crate) map: &'a HashMap<K, V, S>,
-    pub(crate) guard: ThinShield<'a>,
+    pub(crate) guard: Guard<'a>,
 }
 
 impl<K, V, S> Pinned<'_, K, V, S> {
-    /// An iterator visiting all key-value pairs in arbitrary order.
-    /// The iterator element type is `(&'a K, &'a V)`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use seize::HashMap;
-    ///
-    /// let mut map = HashMap::new();
-    /// map.insert("a", 1);
-    /// map.insert("b", 2);
-    /// map.insert("c", 3);
-    ///
-    /// for (key, val) in map.iter() {
-    ///     println!("key: {} val: {}", key, val);
-    /// }
-    /// ```
-    pub fn iter(&self) -> Iter<'_, K, V> {
-        self.map.iter(&self.guard)
-    }
+    // /// An iterator visiting all key-value pairs in arbitrary order.
+    // /// The iterator element type is `(&'a K, &'a V)`.
+    // ///
+    // /// # Examples
+    // ///
+    // /// ```
+    // /// use seize::HashMap;
+    // ///
+    // /// let mut map = HashMap::new();
+    // /// map.insert("a", 1);
+    // /// map.insert("b", 2);
+    // /// map.insert("c", 3);
+    // ///
+    // /// for (key, val) in map.iter() {
+    // ///     println!("key: {} val: {}", key, val);
+    // /// }
+    // /// ```
+    // pub fn iter(&self) -> Iter<'_, K, V> {
+    //     self.map.iter(&self.guard)
+    // }
 
-    /// An iterator visiting all keys in arbitrary order.
-    /// The iterator element type is `&'a K`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use seize::HashMap;
-    ///
-    /// let mut map = HashMap::new();
-    /// map.insert("a", 1);
-    /// map.insert("b", 2);
-    /// map.insert("c", 3);
-    ///
-    /// for key in map.keys() {
-    ///     println!("{}", key);
-    /// }
-    /// ```
-    pub fn keys(&self) -> Keys<'_, K, V> {
-        self.map.keys(&self.guard)
-    }
+    // /// An iterator visiting all keys in arbitrary order.
+    // /// The iterator element type is `&'a K`.
+    // ///
+    // /// # Examples
+    // ///
+    // /// ```
+    // /// use seize::HashMap;
+    // ///
+    // /// let mut map = HashMap::new();
+    // /// map.insert("a", 1);
+    // /// map.insert("b", 2);
+    // /// map.insert("c", 3);
+    // ///
+    // /// for key in map.keys() {
+    // ///     println!("{}", key);
+    // /// }
+    // /// ```
+    // pub fn keys(&self) -> Keys<'_, K, V> {
+    //     self.map.keys(&self.guard)
+    // }
 
-    /// An iterator visiting all values in arbitrary order.
-    /// The iterator element type is `&'a V`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use seize::HashMap;
-    ///
-    /// let mut map = HashMap::new();
-    /// map.insert("a", 1);
-    /// map.insert("b", 2);
-    /// map.insert("c", 3);
-    ///
-    /// for val in map.values() {
-    ///     println!("{}", val);
-    /// }
-    /// ```
-    pub fn values(&self) -> Values<'_, K, V> {
-        self.map.values(&self.guard)
-    }
+    // /// An iterator visiting all values in arbitrary order.
+    // /// The iterator element type is `&'a V`.
+    // ///
+    // /// # Examples
+    // ///
+    // /// ```
+    // /// use seize::HashMap;
+    // ///
+    // /// let mut map = HashMap::new();
+    // /// map.insert("a", 1);
+    // /// map.insert("b", 2);
+    // /// map.insert("c", 3);
+    // ///
+    // /// for val in map.values() {
+    // ///     println!("{}", val);
+    // /// }
+    // /// ```
+    // pub fn values(&self) -> Values<'_, K, V> {
+    //     self.map.values(&self.guard)
+    // }
 
     /// Returns the number of elements in the map.
     ///
@@ -233,41 +232,41 @@ where
         self.map.remove(key, &self.guard)
     }
 
-    /// Clears the map, removing all key-value pairs.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use flurry::HashMap;
-    ///
-    /// let map = HashMap::new();
-    ///
-    /// map.pin().insert(1, "a");
-    /// map.pin().clear();
-    /// assert!(map.pin().is_empty());
-    /// ```
-    pub fn clear(&self) {
-        self.map.clear(&self.guard)
-    }
+    // /// Clears the map, removing all key-value pairs.
+    // ///
+    // /// # Examples
+    // ///
+    // /// ```
+    // /// use flurry::HashMap;
+    // ///
+    // /// let map = HashMap::new();
+    // ///
+    // /// map.pin().insert(1, "a");
+    // /// map.pin().clear();
+    // /// assert!(map.pin().is_empty());
+    // /// ```
+    // pub fn clear(&self) {
+    //     self.map.clear(&self.guard)
+    // }
 
-    /// Reserves capacity for at least `additional` more elements to be inserted
-    /// in the `HashMap`. The collection may reserve more space to avoid
-    /// frequent reallocations.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the new allocation size overflows [`usize`].
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use seize::HashMap;
-    /// let mut map: HashMap<&str, i32> = HashMap::new();
-    /// map.reserve(10);
-    /// ```
-    pub fn reserve(&self, additional: usize) {
-        self.map.reserve(additional, &self.guard);
-    }
+    // /// Reserves capacity for at least `additional` more elements to be inserted
+    // /// in the `HashMap`. The collection may reserve more space to avoid
+    // /// frequent reallocations.
+    // ///
+    // /// # Panics
+    // ///
+    // /// Panics if the new allocation size overflows [`usize`].
+    // ///
+    // /// # Examples
+    // ///
+    // /// ```
+    // /// use seize::HashMap;
+    // /// let mut map: HashMap<&str, i32> = HashMap::new();
+    // /// map.reserve(10);
+    // /// ```
+    // pub fn reserve(&self, additional: usize) {
+    //     self.map.reserve(additional, &self.guard);
+    // }
 }
 
 impl<K, Q, V, S> Index<&'_ Q> for Pinned<'_, K, V, S>
@@ -283,14 +282,14 @@ where
     }
 }
 
-impl<'a, K, V, S> IntoIterator for &'a Pinned<'a, K, V, S> {
-    type Item = (&'a K, &'a V);
-    type IntoIter = Iter<'a, K, V>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter()
-    }
-}
+// impl<'a, K, V, S> IntoIterator for &'a Pinned<'a, K, V, S> {
+//     type Item = (&'a K, &'a V);
+//     type IntoIter = Iter<'a, K, V>;
+//
+//     fn into_iter(self) -> Self::IntoIter {
+//         self.iter()
+//     }
+// }
 
 impl<K, V, S> Clone for Pinned<'_, K, V, S> {
     fn clone(&self) -> Self {
@@ -298,53 +297,53 @@ impl<K, V, S> Clone for Pinned<'_, K, V, S> {
     }
 }
 
-impl<K, V, S> fmt::Debug for Pinned<'_, K, V, S>
-where
-    K: fmt::Debug,
-    V: fmt::Debug,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_map().entries(self).finish()
-    }
-}
+// impl<K, V, S> fmt::Debug for Pinned<'_, K, V, S>
+// where
+//     K: fmt::Debug,
+//     V: fmt::Debug,
+// {
+//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+//         f.debug_map().entries(self).finish()
+//     }
+// }
 
-impl<K, V, S> PartialEq for Pinned<'_, K, V, S>
-where
-    K: Eq + Hash,
-    V: PartialEq,
-    S: BuildHasher,
-{
-    fn eq(&self, other: &Self) -> bool {
-        HashMap::eq(&self.map, &self.guard, &other.map, &other.guard)
-    }
-}
+// impl<K, V, S> PartialEq for Pinned<'_, K, V, S>
+// where
+//     K: Eq + Hash,
+//     V: PartialEq,
+//     S: BuildHasher,
+// {
+//     fn eq(&self, other: &Self) -> bool {
+//         HashMap::eq(&self.map, &self.guard, &other.map, &other.guard)
+//     }
+// }
 
-impl<K, V, S> PartialEq<HashMap<K, V, S>> for Pinned<'_, K, V, S>
-where
-    K: Eq + Hash,
-    V: PartialEq,
-    S: BuildHasher,
-{
-    fn eq(&self, other: &HashMap<K, V, S>) -> bool {
-        *self == other.pin()
-    }
-}
+// impl<K, V, S> PartialEq<HashMap<K, V, S>> for Pinned<'_, K, V, S>
+// where
+//     K: Eq + Hash,
+//     V: PartialEq,
+//     S: BuildHasher,
+// {
+//     fn eq(&self, other: &HashMap<K, V, S>) -> bool {
+//         *self == other.pin()
+//     }
+// }
+//
+// impl<K, V, S> PartialEq<Pinned<'_, K, V, S>> for HashMap<K, V, S>
+// where
+//     K: Eq + Hash,
+//     V: PartialEq,
+//     S: BuildHasher,
+// {
+//     fn eq(&self, other: &Pinned<'_, K, V, S>) -> bool {
+//         self.pin() == *other
+//     }
+// }
 
-impl<K, V, S> PartialEq<Pinned<'_, K, V, S>> for HashMap<K, V, S>
-where
-    K: Eq + Hash,
-    V: PartialEq,
-    S: BuildHasher,
-{
-    fn eq(&self, other: &Pinned<'_, K, V, S>) -> bool {
-        self.pin() == *other
-    }
-}
-
-impl<K, V, S> Eq for Pinned<'_, K, V, S>
-where
-    K: Eq + Hash,
-    V: Eq,
-    S: BuildHasher,
-{
-}
+// impl<K, V, S> Eq for Pinned<'_, K, V, S>
+// where
+//     K: Eq + Hash,
+//     V: Eq,
+//     S: BuildHasher,
+// {
+// }

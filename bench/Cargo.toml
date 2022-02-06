@@ -13,7 +13,7 @@ fxhash = "0.2.1"
 chashmap = "2.2.2"
 contrie = "0.1.4"
 flurry = "0.3.1"
-seize = { path = "../" }
+seizem = { path = "../" }
 dashmap = "=4.0.0-rc6"
 crossbeam-epoch = "0.8"
 crossbeam-epoch-old = { package = "crossbeam-epoch", version = "0.7" }
@@ -26,6 +26,7 @@ json = "0.12.4"
 csv = "1.1.5"
 serde = { version = "1.0.123", features = ["derive"] }
 plotters = "0.3.0"
+seize = { git = "https://github.com/ibraheemdev/seize" }
 
 [profile.release]
 codegen-units = 1
