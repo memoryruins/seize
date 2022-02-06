@@ -4,28 +4,15 @@ use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::ops::Range;
+use std::ptr;
 use std::ptr::NonNull;
-use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicPtr, AtomicUsize};
 use std::sync::Arc;
-use std::{fmt, ptr};
 
-use flize::{Collector, Shield, ThinShield};
 use lock_api::RawMutex;
 use parking_lot::Mutex;
-
-type Atomic<T> = flize::Atomic<T, flize::NullTag, flize::NullTag, 0, 0>;
-type Shared<'a, T> = flize::Shared<'a, T, flize::NullTag, flize::NullTag, 0, 0>;
-
-pub(crate) trait SharedExt<T> {
-    fn boxed(value: T) -> Self;
-}
-
-impl<'a, T> SharedExt<T> for Shared<'a, T> {
-    fn boxed(value: T) -> Self {
-        unsafe { Shared::from_ptr(Box::into_raw(Box::new(value))) }
-    }
-}
+use seize::*;
 
 pub struct HashMap<K, V, S = RandomState> {
     // The maximum number of elements per lock before we re-allocate.
@@ -36,7 +23,7 @@ pub struct HashMap<K, V, S = RandomState> {
     //
     // Wrapping this in a separate struct allows us
     // to atomically swap everything at once.
-    table: Atomic<Table<K, V>>,
+    table: AtomicPtr<Linked<Table<K, V>>>,
     // Instead of adding garbage to the default global collector
     // we add it to a local collector tied to this particular map.
     //
@@ -51,7 +38,7 @@ pub struct HashMap<K, V, S = RandomState> {
 
 struct Table<K, V> {
     // The hashtable.
-    buckets: Box<[Atomic<Node<K, V>>]>,
+    buckets: Box<[AtomicPtr<Linked<Node<K, V>>>]>,
     // A set of locks, each guarding a number of buckets.
     //
     // Locks are shared across table instances during
@@ -64,7 +51,7 @@ struct Table<K, V> {
 impl<K, V> Table<K, V> {
     fn new(buckets_len: usize, locks_len: usize) -> Self {
         Self {
-            buckets: std::iter::repeat_with(Atomic::null)
+            buckets: std::iter::repeat_with(AtomicPtr::default)
                 .take(buckets_len)
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
@@ -122,7 +109,7 @@ struct Node<K, V> {
     // across buckets instances during resize operations.
     value: NonNull<V>,
     // The next node in the linked-list.
-    next: Atomic<Self>,
+    next: AtomicPtr<Linked<Self>>,
     // The hashcode of `key`.
     hash: u64,
 }
@@ -193,12 +180,12 @@ impl<K, V, S> HashMap<K, V, S> {
             hash_builder,
             resize: Arc::new(Mutex::new(())),
             budget: AtomicUsize::new(0),
-            table: Atomic::null(),
+            table: AtomicPtr::default(),
             collector: Collector::new(),
         }
     }
 
-    pub(crate) fn with_capacity_hasher_and_collector(
+    pub fn with_capacity_hasher_and_collector(
         capacity: usize,
         hash_builder: S,
         collector: Collector,
@@ -212,7 +199,7 @@ impl<K, V, S> HashMap<K, V, S> {
         Self {
             resize: Arc::new(Mutex::new(())),
             budget: AtomicUsize::new(resize::budget(capacity, lock_count)),
-            table: Atomic::new(Shared::boxed(Table::new(capacity, lock_count))),
+            table: AtomicPtr::new(collector.link_boxed(Table::new(capacity, lock_count))),
             collector,
             hash_builder,
         }
@@ -255,13 +242,13 @@ impl<K, V, S> HashMap<K, V, S> {
     pub fn pin(&self) -> Pinned<'_, K, V, S> {
         Pinned {
             map: self,
-            guard: self.collector.thin_shield(),
+            guard: self.collector.guard(),
         }
     }
 
     /// Returns the number of elements in the map.
-    pub(crate) fn len(&self, guard: &ThinShield<'_>) -> usize {
-        let table = unsafe { self.table.load(Ordering::Acquire, guard).as_ref() };
+    pub(crate) fn len(&self, guard: &Guard<'_>) -> usize {
+        let table = unsafe { guard.protect(&self.table).as_ref() };
 
         match table {
             Some(table) => table.len(),
@@ -270,54 +257,55 @@ impl<K, V, S> HashMap<K, V, S> {
     }
 
     /// Returns `true` if the map contains no elements.
-    pub(crate) fn is_empty(&self, guard: &ThinShield<'_>) -> bool {
+    pub(crate) fn is_empty(&self, guard: &Guard<'_>) -> bool {
         self.len(guard) == 0
     }
 
-    /// An iterator visiting all key-value pairs in arbitrary order.
-    pub(crate) fn iter<'a>(&'a self, guard: &'a ThinShield<'a>) -> Iter<'a, K, V> {
-        let table = self.table.load(Ordering::Acquire, guard);
-        let first_node = unsafe { table.as_ref().and_then(|t| t.buckets.get(0)) };
+    // /// An iterator visiting all key-value pairs in arbitrary order.
+    // pub(crate) fn iter<'a>(&'a self, guard: &'a Guard<'a, Protection>) -> Iter<'a, K, V> {
+    //     let table = guard.protect(|| self.table.load(Ordering::Acquire));
+    //     let first_node = unsafe { table.as_ref().and_then(|t| t.buckets.get(0)) };
 
-        Iter {
-            size: self.len(guard),
-            current_node: first_node,
-            table,
-            current_bucket: 0,
-            guard,
-        }
-    }
+    //     Iter {
+    //         size: self.len(guard),
+    //         current_node: first_node,
+    //         table,
+    //         current_bucket: 0,
+    //         guard,
+    //     }
+    // }
 
-    /// An iterator visiting all keys in arbitrary order.
-    pub(crate) fn keys<'a>(&'a self, guard: &'a ThinShield<'a>) -> Keys<'a, K, V> {
-        Keys {
-            iter: self.iter(guard),
-        }
-    }
+    // /// An iterator visiting all keys in arbitrary order.
+    // pub(crate) fn keys<'a>(&'a self, guard: &'a Guard<'a, Protection>) -> Keys<'a, K, V> {
+    //     Keys {
+    //         iter: self.iter(guard),
+    //     }
+    // }
 
-    /// An iterator visiting all values in arbitrary order.
-    pub(crate) fn values<'a>(&'a self, guard: &'a ThinShield<'a>) -> Values<'a, K, V> {
-        Values {
-            iter: self.iter(guard),
-        }
-    }
+    // /// An iterator visiting all values in arbitrary order.
+    // pub(crate) fn values<'a>(&'a self, guard: &'a Guard<'a, Protection>) -> Values<'a, K, V> {
+    //     Values {
+    //         iter: self.iter(guard),
+    //     }
+    // }
 
     fn init_table<'a>(
         &'a self,
         capacity: Option<usize>,
-        guard: &'a ThinShield<'a>,
-    ) -> &'a Table<K, V> {
+        guard: &'a Guard<'a>,
+    ) -> &'a Linked<Table<K, V>> {
         let _guard = self.resize.lock();
 
         let capacity = capacity.unwrap_or(resize::DEFAULT_BUCKETS);
-        match unsafe { self.table.load(Ordering::Acquire, guard).as_ref() } {
+        match unsafe { guard.protect(&self.table).as_ref() } {
             Some(table) => table,
             None => {
-                let new_table =
-                    Shared::boxed(Table::new(capacity, resize::initial_locks(capacity)));
+                let new_table = self
+                    .collector
+                    .link_boxed(Table::new(capacity, resize::initial_locks(capacity)));
 
                 self.table.store(new_table, Ordering::Release);
-                unsafe { new_table.as_ref_unchecked() }
+                unsafe { &*new_table }
             }
         }
     }
@@ -329,7 +317,11 @@ where
     S: BuildHasher,
 {
     /// Returns a reference to the value corresponding to the key.
-    pub(crate) fn get<'a, Q: ?Sized>(&'a self, key: &Q, guard: &'a ThinShield<'a>) -> Option<&'a V>
+    pub(crate) fn get<'a, Q: ?Sized>(
+        &'a self,
+        key: &Q,
+        guard: &'a Guard<'a>,
+    ) -> Option<&'a V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq,
@@ -340,19 +332,19 @@ where
     pub(crate) fn get_hashed<'a, Q: ?Sized>(
         &'a self,
         key: &Q,
-        guard: &'a ThinShield<'a>,
+        guard: &'a Guard<'a>,
         hash: u64,
     ) -> Option<&'a V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq,
     {
-        let table = unsafe { self.table.load(Ordering::Acquire, guard).as_ref()? };
+        let table = unsafe { guard.protect(&self.table).as_ref()? };
 
         let bucket_index = bucket_index(hash, table.buckets.len() as _);
 
         let mut walk = &table.buckets[bucket_index as usize];
-        while let Some(node) = unsafe { walk.load(Ordering::Acquire, guard).as_ref() } {
+        while let Some(node) = unsafe { guard.protect(&walk).as_ref() } {
             if node.hash == hash && node.key.borrow() == key {
                 return Some(unsafe { node.value.as_ref() });
             }
@@ -364,7 +356,7 @@ where
     }
 
     /// Returns `true` if the map contains a value for the specified key.
-    pub(crate) fn contains_key<Q: ?Sized>(&self, key: &Q, guard: &ThinShield<'_>) -> bool
+    pub(crate) fn contains_key<Q: ?Sized>(&self, key: &Q, guard: &Guard<'_>) -> bool
     where
         K: Borrow<Q>,
         Q: Hash + Eq,
@@ -402,7 +394,7 @@ where
         &'a self,
         key: K,
         value: V,
-        guard: &'a ThinShield<'a>,
+        guard: &'a Guard<'a>,
     ) -> Option<&'a V> {
         let h = self.hash(&key);
         self.insert_hashed(key, value, guard, h)
@@ -412,13 +404,15 @@ where
         &'a self,
         key: K,
         value: V,
-        guard: &'a ThinShield<'a>,
+        guard: &'a Guard<'a>,
         hash: u64,
     ) -> Option<&'a V> {
         let mut should_resize = false;
 
         loop {
-            let table = match unsafe { self.table.load(Ordering::Acquire, guard).as_ref() } {
+            let table_ptr = guard.protect(&self.table);
+
+            let table = match unsafe { table_ptr.as_ref() } {
                 Some(table) => table,
                 None => self.init_table(None, guard),
             };
@@ -430,7 +424,7 @@ where
                 let _guard = table.locks[lock_index as usize].lock();
 
                 // If the table just got resized, we may not be holding the right lock.
-                if !ptr::eq(table, self.table.load(Ordering::Acquire, guard).as_ptr()) {
+                if !ptr::eq(table, guard.protect(&self.table)) {
                     continue;
                 }
 
@@ -438,7 +432,7 @@ where
                 let mut node_ptr = &table.buckets[bucket_index as usize];
 
                 loop {
-                    let node = node_ptr.load(Ordering::Acquire, guard);
+                    let node = guard.protect(&node_ptr);
 
                     let node_ref = match unsafe { node.as_ref() } {
                         Some(n) => n,
@@ -453,19 +447,22 @@ where
                         // but we have to do an extra allocation here for the node.
                         let new_node = Node {
                             key,
-                            next: Atomic::new(node_ref.next.load(Ordering::Relaxed, guard)),
+                            next: AtomicPtr::new(guard.protect(&node_ref.next)),
                             value: NonNull::from(Box::leak(Box::new(value))),
                             hash,
                         };
 
-                        node_ptr.store(Shared::boxed(new_node), Ordering::Release);
+                        node_ptr.store(self.collector.link_boxed(new_node), Ordering::Release);
 
                         let old_val = unsafe { node_ref.value.as_ref() };
 
-                        guard.retire(move || unsafe {
-                            let _: Box<V> = Box::from_raw(node_ref.value.as_ptr());
-                            let _: Box<Node<K, V>> = Box::from_raw(node.as_ptr());
-                        });
+                        unsafe {
+                            self.collector.retire(node, |mut link| unsafe {
+                                let node = link.cast::<Node<K, V>>();
+                                let _ = Box::from_raw((*node).value.as_ptr());
+                                let _ = Box::from_raw(node);
+                            });
+                        }
 
                         return Some(old_val);
                     }
@@ -477,12 +474,12 @@ where
 
                 let new = Node {
                     key,
-                    next: Atomic::new(node.load(Ordering::Relaxed, guard)),
+                    next: AtomicPtr::new(guard.protect(&node)),
                     value: NonNull::from(Box::leak(Box::new(value))),
                     hash,
                 };
 
-                node.store(Shared::boxed(new), Ordering::Release);
+                node.store(self.collector.link_boxed(new), Ordering::Release);
 
                 let count =
                     unsafe { table.counts[lock_index as usize].fetch_add(1, Ordering::AcqRel) + 1 };
@@ -501,7 +498,7 @@ where
             //
             // Note that we are not holding the lock anymore.
             if should_resize {
-                self.resize(table, None, guard);
+                self.resize(table_ptr, None, guard);
             }
 
             return None;
@@ -513,7 +510,7 @@ where
     pub(crate) fn remove<'a, Q: ?Sized>(
         &'a self,
         key: &Q,
-        guard: &'a ThinShield<'a>,
+        guard: &'a Guard<'a>,
     ) -> Option<&'a V>
     where
         K: Borrow<Q>,
@@ -525,7 +522,7 @@ where
     pub(crate) fn remove_hashed<'a, Q: ?Sized>(
         &'a self,
         key: &Q,
-        guard: &'a ThinShield<'a>,
+        guard: &'a Guard<'a>,
         hash: u64,
     ) -> Option<&'a V>
     where
@@ -533,7 +530,7 @@ where
         Q: Hash + Eq,
     {
         loop {
-            let table = unsafe { self.table.load(Ordering::Acquire, guard).as_ref()? };
+            let table = unsafe { guard.protect(&self.table).as_ref()? };
 
             let bucket_index = bucket_index(hash, table.buckets.len() as _);
             let lock_index = lock_index(bucket_index, table.locks.len() as _);
@@ -542,34 +539,39 @@ where
                 let _guard = table.locks[lock_index as usize].lock();
 
                 // If the table just got resized, we may not be holding the right lock.
-                if !ptr::eq(table, self.table.load(Ordering::Acquire, guard).as_ptr()) {
+                if !ptr::eq(table, guard.protect(&self.table)) {
                     continue;
                 }
 
                 let mut walk = table.buckets.get(bucket_index as usize);
                 while let Some(node_ptr) = walk {
-                    let node = match unsafe { node_ptr.load(Ordering::Acquire, guard).as_ref() } {
+                    let node = guard.protect(&node_ptr);
+
+                    let node_ref = match unsafe { node.as_ref() } {
                         Some(node) => node,
                         None => break,
                     };
 
-                    if hash == node.hash && node.key.borrow() == key {
-                        let next = node.next.load(Ordering::Acquire, guard);
+                    if hash == node_ref.hash && node_ref.key.borrow() == key {
+                        let next = guard.protect(&node_ref.next);
                         node_ptr.store(next, Ordering::Release);
 
                         unsafe { table.counts[lock_index as usize].fetch_min(1, Ordering::AcqRel) };
 
-                        let val = unsafe { node.value.as_ref() };
+                        let val = unsafe { node_ref.value.as_ref() };
 
-                        guard.retire(move || unsafe {
-                            let _: Box<V> = Box::from_raw(node.value.as_ptr());
-                            let _: Box<Node<K, V>> = Box::from_raw(node as *const _ as *mut _);
-                        });
+                        unsafe {
+                            self.collector.retire(node, |mut link| unsafe {
+                                let node = link.cast::<Node<K, V>>();
+                                let _ = Box::from_raw((*node).value.as_ptr());
+                                let _ = Box::from_raw(node);
+                            });
+                        }
 
                         return Some(val);
                     }
 
-                    walk = Some(&node.next);
+                    walk = Some(&node_ref.next);
                 }
             }
 
@@ -577,65 +579,73 @@ where
         }
     }
 
-    /// Clears the map, removing all key-value pairs.
-    pub(crate) fn clear(&self, guard: &ThinShield<'_>) {
-        // TODO: acquire each lock and destroy the buckets guarded by it
-        // sequentially instead of all at once
-        let (table, _guard) = match self.lock_all(guard) {
-            Some(x) => x,
-            // the table was null
-            None => return,
-        };
+    // /// Clears the map, removing all key-value pairs.
+    // pub(crate) fn clear(&self, guard: &Guard<'_, Protection>) {
+    //     // TODO: acquire each lock and destroy the buckets guarded by it
+    //     // sequentially instead of all at once
+    //     let (table, _guard) = match self.lock_all(guard) {
+    //         Some(x) => x,
+    //         // the table was null
+    //         None => return,
+    //     };
 
-        // walk through the table buckets, and set each initial node to null, destroying the rest
-        // of the nodes and values.
-        for bucket_ptr in table.buckets.iter() {
-            match unsafe { bucket_ptr.load(Ordering::Acquire, guard).as_ref() } {
-                Some(bucket) => {
-                    bucket_ptr.store(Shared::null(), Ordering::Release);
+    //     // walk through the table buckets, and set each initial node to null, destroying the rest
+    //     // of the nodes and values.
+    //     for bucket_ptr in table.buckets.iter() {
+    //         let bucket =
+    //             unsafe { guard.protect(|| bucket_ptr.load(Ordering::Acquire)) };
 
-                    guard.retire(move || unsafe {
-                        let _: Box<V> = Box::from_raw(bucket.value.as_ptr());
-                    });
+    //         if bucket.is_null() {
+    //             continue;
+    //         }
 
-                    let mut walk = &bucket.next;
-                    while let Some(node) = unsafe { walk.load(Ordering::Relaxed, guard).as_ref() } {
-                        guard.retire(move || unsafe {
-                            let _: Box<V> = Box::from_raw(node.value.as_ptr());
-                            let _: Box<Node<K, V>> = Box::from_raw(node as *const _ as *mut _);
-                        });
+    //         bucket_ptr.store(ptr::null_mut(), Ordering::Release);
 
-                        walk = &node.next;
-                    }
-                }
-                None => break,
-            }
-        }
+    //         unsafe {
+    //             self.collector.retire(bucket, |link| unsafe {
+    //                 let node = link.cast::<Node<K, V>>();
+    //                 let _: Box<V> = Box::from_raw((*node).value.as_ptr());
+    //             });
+    //         }
 
-        // reset the counts
-        for i in 0..table.counts.len() {
-            table.counts[i].store(0, Ordering::Release);
-        }
+    //         let mut walk = &(*bucket).next;
+    //         while let Some(node) = unsafe { walk.load(Ordering::Relaxed, guard).as_ref() } {
+    //             unsafe {
+    //                 self.collector.retire(node.as_ptr(), |mut link| unsafe {
+    //                     let node = link.cast::<Node<K, V>>();
+    //                     let _ = Box::from_raw((*node).value.as_ptr());
+    //                     let _ = Box::from_raw(node);
+    //                 })
+    //             }
 
-        if let Some(budget) = resize::clear_budget(table.buckets.len(), table.locks.len()) {
-            // store the new budget, which might be different if the map was
-            // badly distributed
-            self.budget.store(budget, Ordering::SeqCst);
-        }
-    }
+    //             walk = &node.next;
+    //         }
+    //     }
 
-    /// Reserves capacity for at least additional more elements to be inserted in the `HashMap`.
-    pub(crate) fn reserve<'a>(&'a self, additional: usize, guard: &'a ThinShield<'a>) {
-        match unsafe { self.table.load(Ordering::Acquire, guard).as_ref() } {
-            Some(table) => {
-                let capacity = table.len() + additional;
-                self.resize(table, Some(capacity), guard);
-            }
-            None => {
-                self.init_table(Some(additional), guard);
-            }
-        }
-    }
+    //     // reset the counts
+    //     for i in 0..table.counts.len() {
+    //         table.counts[i].store(0, Ordering::Release);
+    //     }
+
+    //     if let Some(budget) = resize::clear_budget(table.buckets.len(), table.locks.len()) {
+    //         // store the new budget, which might be different if the map was
+    //         // badly distributed
+    //         self.budget.store(budget, Ordering::SeqCst);
+    //     }
+    // }
+
+    // /// Reserves capacity for at least additional more elements to be inserted in the `HashMap`.
+    // pub(crate) fn reserve<'a>(&'a self, additional: usize, guard: &'a Guard<'a, Protection>) {
+    //     match unsafe { self.table.load(Ordering::Acquire, guard).as_ref() } {
+    //         Some(table) => {
+    //             let capacity = table.len() + additional;
+    //             self.resize(table, Some(capacity), guard);
+    //         }
+    //         None => {
+    //             self.init_table(Some(additional), guard);
+    //         }
+    //     }
+    // }
 
     /// Replaces the hash-table with a larger one.
     ///
@@ -651,14 +661,16 @@ where
     /// resizing behavior.
     fn resize<'a>(
         &'a self,
-        table: &'a Table<K, V>,
+        table: *mut Linked<Table<K, V>>,
         new_len: Option<usize>,
-        guard: &'a ThinShield<'a>,
+        guard: &'a Guard<'a>,
     ) {
         let _guard = self.resize.lock();
 
+        let table_ref = unsafe { &*table };
+
         // Make sure nobody resized the table while we were waiting for the resize lock.
-        if !ptr::eq(table, self.table.load(Ordering::Acquire, guard).as_ptr()) {
+        if !ptr::eq(table, guard.protect(&self.table)) {
             // We assume that since the table reference is different, it was
             // already resized (or the budget was adjusted). If we ever decide
             // to do table shrinking, or replace the table for other reasons,
@@ -666,7 +678,7 @@ where
             return;
         }
 
-        let current_locks = table.locks.len();
+        let current_locks = table_ref.locks.len();
 
         let (new_len, new_locks_len, new_budget) = match new_len {
             Some(len) => {
@@ -674,7 +686,7 @@ where
                 let budget = resize::budget(len, locks.unwrap_or(current_locks));
                 (len, locks, budget)
             }
-            None => match resize::resize(table.buckets.len(), current_locks, table.len()) {
+            None => match resize::resize(table_ref.buckets.len(), current_locks, table_ref.len()) {
                 resize::Resize::Resize {
                     buckets,
                     locks,
@@ -695,7 +707,7 @@ where
             let mut locks = Vec::with_capacity(len);
 
             for i in 0..current_locks {
-                locks.push(table.locks[i].clone());
+                locks.push(table_ref.locks[i].clone());
             }
 
             for _ in current_locks..len {
@@ -709,16 +721,17 @@ where
             .take(new_locks_len.unwrap_or(current_locks))
             .collect::<Vec<AtomicUsize>>();
 
-        let mut new_buckets = std::iter::repeat_with(Atomic::null)
+        let mut new_buckets = std::iter::repeat_with(AtomicPtr::default)
             .take(new_len)
-            .collect::<Vec<Atomic<_>>>();
+            .collect::<Vec<AtomicPtr<_>>>();
 
         // Now lock the rest of the buckets to make sure nothing is modified while resizing.
-        let _guard_rest = table.lock_range(0..table.locks.len());
+        let _guard_rest = table_ref.lock_range(0..table_ref.locks.len());
 
         // Copy all data into a new buckets, creating new nodes for all elements.
-        for i in 0..table.buckets.len() {
-            let mut walk = table.buckets[i].load(Ordering::Relaxed, guard);
+        for i in 0..table_ref.buckets.len() {
+            let mut walk = guard.protect(&table_ref.buckets[i]);
+
             while let Some(node) = unsafe { walk.as_ref() } {
                 let new_bucket_index = bucket_index(node.hash, new_len as _);
                 let new_lock_index = lock_index(
@@ -726,26 +739,29 @@ where
                     new_locks_len.unwrap_or(current_locks) as _,
                 );
 
-                let next = node.next.load(Ordering::Relaxed, guard);
-                let head = new_buckets[new_bucket_index as usize].load(Ordering::Relaxed, guard);
+                let next = guard.protect(&node.next);
+                let head = new_buckets[new_bucket_index as usize].load(Ordering::Relaxed);
 
                 // if `next` is the same as the new head, we can skip an allocation and just copy
                 // the pointer
                 if next == head {
-                    new_buckets[new_bucket_index as usize] = Atomic::new(walk);
+                    new_buckets[new_bucket_index as usize] = AtomicPtr::new(walk);
                 } else {
-                    new_buckets[new_bucket_index as usize] = Atomic::new(Shared::boxed(Node {
-                        key: node.key.clone(),
-                        value: node.value.clone(),
-                        next: Atomic::new(
-                            new_buckets[new_bucket_index as usize].load(Ordering::Relaxed, guard),
-                        ),
-                        hash: node.hash,
-                    }));
+                    new_buckets[new_bucket_index as usize] =
+                        AtomicPtr::new(self.collector.link_boxed(Node {
+                            key: node.key.clone(),
+                            value: node.value.clone(),
+                            next: AtomicPtr::new(
+                                new_buckets[new_bucket_index as usize].load(Ordering::Relaxed),
+                            ),
+                            hash: node.hash,
+                        }));
 
-                    guard.retire(move || unsafe {
-                        let _: Box<Node<K, V>> = Box::from_raw(walk.as_ptr());
-                    });
+                    unsafe {
+                        self.collector.retire(walk, move |mut link| unsafe {
+                            let _ = Box::from_raw(link.cast::<Node<K, V>>());
+                        });
+                    }
                 }
 
                 new_counts[new_lock_index as usize].fetch_add(1, Ordering::Relaxed);
@@ -757,32 +773,35 @@ where
         self.budget.store(new_budget, Ordering::SeqCst);
 
         self.table.store(
-            Shared::boxed(Table {
+            self.collector.link_boxed(Table {
                 buckets: new_buckets.into_boxed_slice(),
                 locks: new_locks
                     .map(Arc::from)
-                    .unwrap_or_else(|| table.locks.clone()),
+                    .unwrap_or_else(|| table_ref.locks.clone()),
                 counts: new_counts.into_boxed_slice(),
             }),
             Ordering::Release,
         );
 
-        guard.retire(move || unsafe {
-            let _: Box<Table<K, V>> = Box::from_raw(table as *const _ as *mut _);
-        });
+        unsafe {
+            self.collector.retire(table, move |mut link| unsafe {
+                let _ = Box::from_raw(link.cast::<Table<K, V>>());
+            });
+        }
     }
 
     /// Acquires all locks for this table.
     fn lock_all<'a>(
         &'a self,
-        guard: &'a ThinShield<'a>,
+        guard: &'a Guard<'a>,
     ) -> Option<(&'a Table<K, V>, impl Drop + 'a)> {
         // Acquire the resize lock.
         let _guard = self.resize.lock();
 
         // Now that we have the resize lock, we can safely load the table and acquire it's
         // locks, knowing that it cannot change.
-        let table = unsafe { self.table.load(Ordering::Acquire, guard).as_ref()? };
+        let table = unsafe { guard.protect(&self.table).as_ref()? };
+
         let _guard_rest = table.lock_range(0..table.locks.len());
 
         struct Guard<A, B>(A, B);
@@ -813,25 +832,23 @@ fn lock_index(bucket_index: u64, lock_count: u64) -> u64 {
 
 impl<K, V, S> Drop for HashMap<K, V, S> {
     fn drop(&mut self) {
-        let guard = unsafe { flize::unprotected() };
-
-        let table = self.table.load(Ordering::Relaxed, guard);
+        let table = self.table.load(Ordering::Relaxed);
 
         // table was never allocated
         if table.is_null() {
             return;
         }
 
-        let mut table = unsafe { Box::from_raw(table.as_ptr()) };
+        let mut table = unsafe { Box::from_raw(table) };
 
         // drop all nodes and values
         for bucket in table.buckets.iter_mut() {
-            let mut walk = bucket.load(Ordering::Relaxed, guard);
-            while let Some(node) = unsafe { walk.as_ref() } {
-                let node: Box<Node<K, V>> = unsafe { Box::from_raw(node as *const _ as *mut _) };
-                let _: Box<V> = unsafe { Box::from_raw(node.value.as_ptr()) };
+            let mut walk = bucket.load(Ordering::Relaxed);
+            while let Some(node) = unsafe { walk.as_mut() } {
+                let node = unsafe { Box::from_raw(node) };
+                let _ = unsafe { Box::from_raw(node.value.as_ptr()) };
 
-                walk = node.next.load(Ordering::Relaxed, guard);
+                walk = node.next.load(Ordering::Relaxed);
             }
         }
     }
@@ -853,38 +870,38 @@ where
 {
 }
 
-impl<K, V, S> Clone for HashMap<K, V, S>
-where
-    K: Sync + Send + Clone + Hash + Eq,
-    V: Sync + Send + Clone,
-    S: BuildHasher + Clone,
-{
-    fn clone(&self) -> HashMap<K, V, S> {
-        let self_pinned = self.pin();
+// impl<K, V, S> Clone for HashMap<K, V, S>
+// where
+//     K: Sync + Send + Clone + Hash + Eq,
+//     V: Sync + Send + Clone,
+//     S: BuildHasher + Clone,
+// {
+//     fn clone(&self) -> HashMap<K, V, S> {
+//         let self_pinned = self.pin();
+//
+//         let clone = Self::with_capacity_and_hasher(self_pinned.len(), self.hash_builder.clone());
+//         {
+//             let clone_pinned = clone.pin();
+//
+//             for (k, v) in self_pinned.iter() {
+//                 clone_pinned.insert(k.clone(), v.clone());
+//             }
+//         }
+//
+//         clone
+//     }
+// }
 
-        let clone = Self::with_capacity_and_hasher(self_pinned.len(), self.hash_builder.clone());
-        {
-            let clone_pinned = clone.pin();
-
-            for (k, v) in self_pinned.iter() {
-                clone_pinned.insert(k.clone(), v.clone());
-            }
-        }
-
-        clone
-    }
-}
-
-impl<K, V, S> fmt::Debug for HashMap<K, V, S>
-where
-    K: fmt::Debug,
-    V: fmt::Debug,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let guard = self.collector.thin_shield();
-        f.debug_map().entries(self.iter(&guard)).finish()
-    }
-}
+// impl<K, V, S> fmt::Debug for HashMap<K, V, S>
+// where
+//     K: fmt::Debug,
+//     V: fmt::Debug,
+// {
+//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+//         let guard = self.collector.thin_shield();
+//         f.debug_map().entries(self.iter(&guard)).finish()
+//     }
+// }
 
 impl<K, V, S> Default for HashMap<K, V, S>
 where
@@ -895,228 +912,228 @@ where
     }
 }
 
-impl<K, V, S> HashMap<K, V, S>
-where
-    K: Eq + Hash,
-    V: PartialEq,
-    S: BuildHasher,
-{
-    pub(crate) fn eq(
-        &self,
-        guard: &ThinShield<'_>,
-        other: &Self,
-        other_guard: &ThinShield<'_>,
-    ) -> bool {
-        if self.len(guard) != other.len(other_guard) {
-            return false;
-        }
+// impl<K, V, S> HashMap<K, V, S>
+// where
+//     K: Eq + Hash,
+//     V: PartialEq,
+//     S: BuildHasher,
+// {
+//     pub(crate) fn eq(
+//         &self,
+//         guard: &Guard<'_, Protection>,
+//         other: &Self,
+//         other_guard: &Guard<'_, Protection>,
+//     ) -> bool {
+//         if self.len(guard) != other.len(other_guard) {
+//             return false;
+//         }
+//
+//         self.iter(guard)
+//             .all(|(key, value)| other.get(key, other_guard).map_or(false, |v| *value == *v))
+//     }
+// }
+//
+// impl<K, V, S> PartialEq for HashMap<K, V, S>
+// where
+//     K: Eq + Hash,
+//     V: PartialEq,
+//     S: BuildHasher,
+// {
+//     fn eq(&self, other: &Self) -> bool {
+//         let guard = self.collector.thin_shield();
+//         let other_guard = other.collector.thin_shield();
+//
+//         Self::eq(self, &guard, other, &other_guard)
+//     }
+// }
+//
+// impl<K, V, S> Eq for HashMap<K, V, S>
+// where
+//     K: Eq + Hash,
+//     V: Eq,
+//     S: BuildHasher,
+// {
+// }
 
-        self.iter(guard)
-            .all(|(key, value)| other.get(key, other_guard).map_or(false, |v| *value == *v))
-    }
-}
-
-impl<K, V, S> PartialEq for HashMap<K, V, S>
-where
-    K: Eq + Hash,
-    V: PartialEq,
-    S: BuildHasher,
-{
-    fn eq(&self, other: &Self) -> bool {
-        let guard = self.collector.thin_shield();
-        let other_guard = other.collector.thin_shield();
-
-        Self::eq(self, &guard, other, &other_guard)
-    }
-}
-
-impl<K, V, S> Eq for HashMap<K, V, S>
-where
-    K: Eq + Hash,
-    V: Eq,
-    S: BuildHasher,
-{
-}
-
-/// An iterator over the entries of a `HashMap`.
-///
-/// This `struct` is created by the [`iter`] method on [`HashMap`]. See its
-/// documentation for more.
-///
-/// [`iter`]: HashMap::iter
-///
-/// # Example
-///
-/// ```
-/// use seize::HashMap;
-///
-/// let mut map = HashMap::new();
-/// map.insert("a", 1);
-/// let iter = map.iter();
-/// ```
-pub struct Iter<'a, K, V> {
-    table: Shared<'a, Table<K, V>>,
-    guard: &'a ThinShield<'a>,
-    current_node: Option<&'a Atomic<Node<K, V>>>,
-    current_bucket: usize,
-    size: usize,
-}
-
-impl<'a, K, V> Iterator for Iter<'a, K, V> {
-    type Item = (&'a K, &'a V);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let table = match unsafe { self.table.as_ref() } {
-                Some(table) => table,
-                None => return None,
-            };
-
-            if let Some(node) = &self
-                .current_node
-                .and_then(|n| unsafe { n.load(Ordering::Acquire, self.guard).as_ref() })
-            {
-                self.size -= 1;
-                self.current_node = Some(&node.next);
-                return Some((&node.key, unsafe { node.value.as_ref() }));
-            }
-
-            self.current_bucket += 1;
-
-            if self.current_bucket >= table.buckets.len() {
-                return None;
-            }
-
-            self.current_node = Some(&table.buckets[self.current_bucket]);
-        }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.size, Some(self.size))
-    }
-}
-
-impl<K, V> fmt::Debug for Iter<'_, K, V>
-where
-    K: fmt::Debug,
-    V: fmt::Debug,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_map().entries(self.clone()).finish()
-    }
-}
-
-impl<K, V> Clone for Iter<'_, K, V> {
-    fn clone(&self) -> Self {
-        Self {
-            table: self.table,
-            guard: self.guard,
-            current_node: self.current_node,
-            current_bucket: self.current_bucket,
-            size: self.size,
-        }
-    }
-}
-
-/// An iterator over the keys of a `HashMap`.
-///
-/// This `struct` is created by the [`keys`] method on [`HashMap`]. See its
-/// documentation for more.
-///
-/// [`keys`]: HashMap::keys
-///
-/// # Example
-///
-/// ```
-/// use seize::HashMap;
-///
-/// let mut map = HashMap::new();
-/// map.insert("a", 1);
-/// let iter_keys = map.keys();
-/// ```
-pub struct Keys<'a, K, V> {
-    iter: Iter<'a, K, V>,
-}
-
-impl<'a, K, V> Iterator for Keys<'a, K, V> {
-    type Item = &'a K;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.iter.next().map(|(k, _)| k)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.iter.size_hint()
-    }
-}
-
-impl<K, V> fmt::Debug for Keys<'_, K, V>
-where
-    K: fmt::Debug,
-    V: fmt::Debug,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list().entries(self.clone()).finish()
-    }
-}
-
-impl<K, V> Clone for Keys<'_, K, V> {
-    fn clone(&self) -> Self {
-        Self {
-            iter: self.iter.clone(),
-        }
-    }
-}
-
-/// An iterator over the values of a `HashMap`.
-///
-/// This `struct` is created by the [`values`] method on [`HashMap`]. See its
-/// documentation for more.
-///
-/// [`values`]: HashMap::values
-///
-/// # Example
-///
-/// ```
-/// use seize::HashMap;
-///
-/// let mut map = HashMap::new();
-/// map.insert("a", 1);
-/// let iter_values = map.values();
-/// ```
-pub struct Values<'a, K, V> {
-    iter: Iter<'a, K, V>,
-}
-
-impl<'a, K, V> Iterator for Values<'a, K, V> {
-    type Item = &'a V;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.iter.next().map(|(_, v)| v)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.iter.size_hint()
-    }
-}
-
-impl<K, V> fmt::Debug for Values<'_, K, V>
-where
-    K: fmt::Debug,
-    V: fmt::Debug,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list().entries(self.clone()).finish()
-    }
-}
-
-impl<K, V> Clone for Values<'_, K, V> {
-    fn clone(&self) -> Self {
-        Self {
-            iter: self.iter.clone(),
-        }
-    }
-}
+// /// An iterator over the entries of a `HashMap`.
+// ///
+// /// This `struct` is created by the [`iter`] method on [`HashMap`]. See its
+// /// documentation for more.
+// ///
+// /// [`iter`]: HashMap::iter
+// ///
+// /// # Example
+// ///
+// /// ```
+// /// use seize::HashMap;
+// ///
+// /// let mut map = HashMap::new();
+// /// map.insert("a", 1);
+// /// let iter = map.iter();
+// /// ```
+// pub struct Iter<'a, K, V> {
+//     table: Shared<'a, Table<K, V>>,
+//     guard: &'a Guard<'a, Protection>,
+//     current_node: Option<&'a Atomic<Node<K, V>>>,
+//     current_bucket: usize,
+//     size: usize,
+// }
+//
+// impl<'a, K, V> Iterator for Iter<'a, K, V> {
+//     type Item = (&'a K, &'a V);
+//
+//     fn next(&mut self) -> Option<Self::Item> {
+//         loop {
+//             let table = match unsafe { self.table.as_ref() } {
+//                 Some(table) => table,
+//                 None => return None,
+//             };
+//
+//             if let Some(node) = &self
+//                 .current_node
+//                 .and_then(|n| unsafe { n.load(Ordering::Acquire, self.guard).as_ref() })
+//             {
+//                 self.size -= 1;
+//                 self.current_node = Some(&node.next);
+//                 return Some((&node.key, unsafe { node.value.as_ref() }));
+//             }
+//
+//             self.current_bucket += 1;
+//
+//             if self.current_bucket >= table.buckets.len() {
+//                 return None;
+//             }
+//
+//             self.current_node = Some(&table.buckets[self.current_bucket]);
+//         }
+//     }
+//
+//     fn size_hint(&self) -> (usize, Option<usize>) {
+//         (self.size, Some(self.size))
+//     }
+// }
+//
+// impl<K, V> fmt::Debug for Iter<'_, K, V>
+// where
+//     K: fmt::Debug,
+//     V: fmt::Debug,
+// {
+//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+//         f.debug_map().entries(self.clone()).finish()
+//     }
+// }
+//
+// impl<K, V> Clone for Iter<'_, K, V> {
+//     fn clone(&self) -> Self {
+//         Self {
+//             table: self.table,
+//             guard: self.guard,
+//             current_node: self.current_node,
+//             current_bucket: self.current_bucket,
+//             size: self.size,
+//         }
+//     }
+// }
+//
+// /// An iterator over the keys of a `HashMap`.
+// ///
+// /// This `struct` is created by the [`keys`] method on [`HashMap`]. See its
+// /// documentation for more.
+// ///
+// /// [`keys`]: HashMap::keys
+// ///
+// /// # Example
+// ///
+// /// ```
+// /// use seize::HashMap;
+// ///
+// /// let mut map = HashMap::new();
+// /// map.insert("a", 1);
+// /// let iter_keys = map.keys();
+// /// ```
+// pub struct Keys<'a, K, V> {
+//     iter: Iter<'a, K, V>,
+// }
+//
+// impl<'a, K, V> Iterator for Keys<'a, K, V> {
+//     type Item = &'a K;
+//
+//     fn next(&mut self) -> Option<Self::Item> {
+//         self.iter.next().map(|(k, _)| k)
+//     }
+//
+//     fn size_hint(&self) -> (usize, Option<usize>) {
+//         self.iter.size_hint()
+//     }
+// }
+//
+// impl<K, V> fmt::Debug for Keys<'_, K, V>
+// where
+//     K: fmt::Debug,
+//     V: fmt::Debug,
+// {
+//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+//         f.debug_list().entries(self.clone()).finish()
+//     }
+// }
+//
+// impl<K, V> Clone for Keys<'_, K, V> {
+//     fn clone(&self) -> Self {
+//         Self {
+//             iter: self.iter.clone(),
+//         }
+//     }
+// }
+//
+// /// An iterator over the values of a `HashMap`.
+// ///
+// /// This `struct` is created by the [`values`] method on [`HashMap`]. See its
+// /// documentation for more.
+// ///
+// /// [`values`]: HashMap::values
+// ///
+// /// # Example
+// ///
+// /// ```
+// /// use seize::HashMap;
+// ///
+// /// let mut map = HashMap::new();
+// /// map.insert("a", 1);
+// /// let iter_values = map.values();
+// /// ```
+// pub struct Values<'a, K, V> {
+//     iter: Iter<'a, K, V>,
+// }
+//
+// impl<'a, K, V> Iterator for Values<'a, K, V> {
+//     type Item = &'a V;
+//
+//     fn next(&mut self) -> Option<Self::Item> {
+//         self.iter.next().map(|(_, v)| v)
+//     }
+//
+//     fn size_hint(&self) -> (usize, Option<usize>) {
+//         self.iter.size_hint()
+//     }
+// }
+//
+// impl<K, V> fmt::Debug for Values<'_, K, V>
+// where
+//     K: fmt::Debug,
+//     V: fmt::Debug,
+// {
+//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+//         f.debug_list().entries(self.clone()).finish()
+//     }
+// }
+//
+// impl<K, V> Clone for Values<'_, K, V> {
+//     fn clone(&self) -> Self {
+//         Self {
+//             iter: self.iter.clone(),
+//         }
+//     }
+// }
 
 #[cfg(test)]
 mod tests {
@@ -1145,14 +1162,14 @@ mod tests {
                 assert_eq!(pinned.get(&i), Some(&"a"));
             }
 
-            assert!([
-                pinned.iter().count(),
-                pinned.len(),
-                pinned.iter().size_hint().0,
-                pinned.iter().size_hint().1.unwrap()
-            ]
-            .iter()
-            .all(|&l| l == 10000));
+            // assert!([
+            //     pinned.iter().count(),
+            //     pinned.len(),
+            //     pinned.iter().size_hint().0,
+            //     pinned.iter().size_hint().1.unwrap()
+            // ]
+            // .iter()
+            // .all(|&l| l == 10000));
         }
 
         drop(map);

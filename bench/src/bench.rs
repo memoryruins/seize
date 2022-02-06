@@ -104,8 +104,8 @@ fn run(options: &Options, h: &mut Handler) {
         // case::<CHashMapTable<u64>>("CHashMap", options, h);
     } else {
         // case::<RwLockStdHashMapTable<u64, FxBuildHasher>>("RwLock<FxHashMap>", options, h);
-        case::<DashMapTable<u64, FxBuildHasher>>("FxDashMap", options, h);
         case::<SeizeTable<u64, FxBuildHasher>>("FxSeize", options, h);
+        case::<DashMapTable<u64, FxBuildHasher>>("FxDashMap", options, h);
         // case::<FlurryTable<u64, FxBuildHasher>>("FxFlurry", options, h);
         // case::<ShardedSeizeTable<u64, FxBuildHasher>>("FxShardedSeize", options, h);
         // case::<EvmapTable<u64, FxBuildHasher>>("FxEvmap", options, h);

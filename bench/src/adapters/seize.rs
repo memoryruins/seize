@@ -33,9 +33,9 @@ impl Clone for Value {
 }
 
 #[derive(Clone)]
-pub struct SeizeTable<K, H>(Arc<seize::HashMap<K, Value, H>>);
+pub struct SeizeTable<K, H>(Arc<seizem::HashMap<K, Value, H>>);
 
-pub struct SeizeHandle<K: 'static, H: 'static>(&'static seize::HashMap<K, Value, H>);
+pub struct SeizeHandle<K: 'static, H: 'static>(&'static seizem::HashMap<K, Value, H>);
 
 impl<H> Collection for SeizeTable<u64, H>
 where
@@ -44,7 +44,7 @@ where
     type Handle = SeizeHandle<u64, H>;
 
     fn with_capacity(capacity: usize) -> Self {
-        Self(Arc::new(seize::HashMap::with_capacity_and_hasher(
+        Self(Arc::new(seizem::HashMap::with_capacity_and_hasher(
             capacity,
             H::default(),
         )))
@@ -62,10 +62,14 @@ where
     type Key = u64;
 
     fn get(&mut self, key: &Self::Key) -> bool {
+        // println!("IN GET");
+
         self.0.pin().get(key).is_some()
     }
 
     fn insert(&mut self, key: &Self::Key) -> bool {
+        // println!("IN INSERT");
+
         self.0
             .pin()
             .insert(*key, Value(AtomicU64::new(0)))
@@ -73,10 +77,14 @@ where
     }
 
     fn remove(&mut self, key: &Self::Key) -> bool {
+        // println!("IN REMOVE");
+
         self.0.pin().remove(key).is_some()
     }
 
     fn update(&mut self, key: &Self::Key) -> bool {
+        // println!("IN UPDATE");
+
         self.0
             .pin()
             .get(key)
@@ -85,11 +93,11 @@ where
     }
 }
 
-// pub struct ShardedSeizeTable<K, H>(Arc<seize::Sharded<K, Value, H>>);
+// pub struct ShardedSeizeTable<K, H>(Arc<seizem::Sharded<K, Value, H>>);
 //
 // pub struct ShardedSeizeHandle<K: 'static, H: 'static>(
-//     &'static seize::Sharded<K, Value, H>,
-//     seize::Guard,
+//     &'static seizem::Sharded<K, Value, H>,
+//     seizem::Guard,
 // );
 //
 // impl<H> Collection for ShardedSeizeTable<u64, H>
@@ -99,14 +107,14 @@ where
 //     type Handle = ShardedSeizeHandle<u64, H>;
 //
 //     fn with_capacity(capacity: usize) -> Self {
-//         Self(Arc::new(seize::Sharded::with_capacity_and_hasher(
+//         Self(Arc::new(seizem::Sharded::with_capacity_and_hasher(
 //             capacity,
 //             H::default(),
 //         )))
 //     }
 //
 //     fn pin(&self) -> Self::Handle {
-//         let map: &'static seize::Sharded<_, _, _> = unsafe { std::mem::transmute(&*self.0) };
+//         let map: &'static seizem::Sharded<_, _, _> = unsafe { std::mem::transmute(&*self.0) };
 //         ShardedSeizeHandle(map, self.0.pin())
 //     }
 // }
